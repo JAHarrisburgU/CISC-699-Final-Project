@@ -1,0 +1,175 @@
+# -*- coding: utf-8 -*-
+"""
+Bot Monitor (Production Version)
+
+This script connects to the Telegram API using Telethon.
+It listens for new messages in all channels the bot is a part of,
+parses them for IOCs, and writes structured logs.
+
+This script is launched by threat_intelligence_harvester.py.
+"""
+
+import sys
+import json
+import datetime
+import re
+import asyncio  # Required for Telethon
+from telethon import TelegramClient, events
+
+# --- NEW: Import the config manager ---
+import config_manager 
+
+# --- IOC Regex Patterns ---
+# A dictionary of regular expressions to find different IOC types.
+# These can be made much more complex and accurate.
+IOC_PATTERNS = {
+    "phishing_url": r"https?://[^\s/$.?#].[^\s]*",
+    "malicious_ip": r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+    "email_address": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
+    # A very basic pattern for BTC wallets
+    "btc_wallet": r"\b(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}\b"
+}
+
+# --- Credentials are now loaded from config_manager ---
+# All hard-coded API_ID and API_HASH values have been removed.
+
+
+class BotMonitor:
+    def __init__(self, bot_token, bot_id, api_id, api_hash):
+        self.bot_token = bot_token
+        self.bot_id = bot_id
+        self.bot_name = f"harvester-{str(self.bot_id).zfill(3)}"
+        self.log_file = "harvester_events.log"
+        
+        # Each bot needs a unique session file to store its login state
+        session_file = f"sessions/{self.bot_name}.session"
+
+        # Initialize the Telethon client
+        self.client = TelegramClient(
+            session_file,
+            api_id,
+            api_hash,
+            # Use IPv4 by default, helps with some connection issues
+            connection_retries=5,
+            auto_reconnect=True
+        )
+
+    def log_event(self, event_type, data):
+        """Appends a structured JSON log entry to the event file."""
+        log_entry = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "bot_name": self.bot_name,
+            "event_type": event_type,
+            "data": data
+        }
+        # Use a lock to prevent race conditions when writing to the same file
+        # (Though 'a' mode is generally safe, this is best practice)
+        try:
+            with open(self.log_file, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception as e:
+            print(f"[Error][{self.bot_name}] Failed to write log: {e}")
+
+    async def _parse_message(self, message_text, source_channel):
+        """Parses a raw message for IOCs and logs any findings."""
+        
+        found_iocs = False
+        for ioc_type, pattern in IOC_PATTERNS.items():
+            matches = re.findall(pattern, message_text, re.IGNORECASE)
+            
+            for match in matches:
+                # You might add a whitelist here to filter out common domains
+                # (e.g., google.com, telegram.org)
+                
+                event_data = {
+                    "ioc_type": ioc_type,
+                    "value": match,
+                    "source_channel": source_channel,
+                    "confidence": "high" # Could be based on regex strength
+                }
+                self.log_event("ioc_discovered", event_data)
+                found_iocs = True
+        
+        return found_iocs
+
+    async def _message_handler(self, event):
+        """This function is called by Telethon for every new message."""
+        
+        # Get the raw text of the message
+        message_text = event.message.text
+        
+        # Get the name of the channel
+        source_channel = "Unknown"
+        if event.chat:
+            source_channel = getattr(event.chat, 'title', f"ChatID:{event.chat_id}")
+
+        # Log the raw message itself for full context (optional, but good)
+        raw_log = {
+            "message_id": event.message.id,
+            "source_channel": source_channel,
+            "content": message_text
+        }
+        self.log_event("raw_message_received", raw_log)
+
+        # Parse the message for IOCs
+        await self._parse_message(message_text, source_channel)
+
+    async def start_listening(self):
+        """
+        Connects the bot to Telegram and starts the event listener.
+        This function runs forever.
+        """
+        try:
+            # Connect to Telegram using the bot token
+            await self.client.start(bot_token=self.bot_token)
+            self.log_event("bot_startup", {"message": f"Bot {self.bot_name} is online and connected to API."})
+            print(f"[{self.bot_name}] Connected and listening...")
+
+            # Add the event handler
+            # This tells Telethon: "When a NewMessage event happens,
+            # call self._message_handler"
+            self.client.add_event_handler(self._message_handler, events.NewMessage())
+
+            # This keeps the script alive, waiting for events.
+            await self.client.run_until_disconnected()
+
+        except Exception as e:
+            error_msg = f"Bot {self.bot_name} failed: {e}"
+            print(f"[CRITICAL][{self.bot_name}] {error_msg}")
+            self.log_event("bot_critical_failure", {"message": error_msg})
+        finally:
+            if self.client.is_connected():
+                await self.client.disconnect()
+            self.log_event("bot_shutdown", {"message": f"Bot {self.bot_name} disconnected."})
+
+
+async def main(token, bot_id):
+    """Main async function to run the monitor."""
+    
+    # --- NEW: Load credentials from the file ---
+    # This replaces the old check for hard-coded values
+    print(f"[{bot_id}] Loading API credentials from config.ini...")
+    api_id, api_hash = config_manager.load_config()
+    
+    monitor = BotMonitor(token, bot_id, api_id, api_hash)
+    await monitor.start_listening()
+
+
+if __name__ == "__main__":
+    # This script expects to be called by threat_intelligence_harvester.py
+    if len(sys.argv) < 3:
+        print("Usage: python3 bot_monitor.py <bot_token> <bot_id>")
+        sys.exit(1)
+
+    bot_token_arg = sys.argv[1]
+    bot_id_arg = sys.argv[2]
+    
+    # Create the 'sessions' directory if it doesn't exist
+    import os
+    os.makedirs("sessions", exist_ok=True)
+
+    # Telethon is async, so we must run it in an async event loop
+    try:
+        asyncio.run(main(bot_token_arg, bot_id_arg))
+    except KeyboardInterrupt:
+        print(f"\n[Main] Shutdown signal received for {bot_id_arg}.")
